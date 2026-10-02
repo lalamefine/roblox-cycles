@@ -1,0 +1,10 @@
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+!assets/**
+sourcemap.json
+globalTypes.d.luau
+roblox.yml
+/build
+.env

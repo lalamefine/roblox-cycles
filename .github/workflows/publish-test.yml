@@ -1,0 +1,35 @@
+name: Publier la place de test
+
+# Publie main sur la place de test si les secrets sont configurés.
+# La place publique ne se publie qu'à la main (scripts/publish.sh prod).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+      ROBLOX_UNIVERSE_ID: ${{ vars.ROBLOX_UNIVERSE_ID }}
+      ROBLOX_TEST_PLACE_ID: ${{ vars.ROBLOX_TEST_PLACE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vérifier la configuration
+        id: cfg
+        run: |
+          if [ -z "$ROBLOX_API_KEY" ] || [ -z "$ROBLOX_UNIVERSE_ID" ] || [ -z "$ROBLOX_TEST_PLACE_ID" ]; then
+            echo "Secrets Roblox absents : publication ignorée."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Installer Rokit et les outils
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          curl -sSf https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.sh | bash
+          echo "$HOME/.rokit/bin" >> "$GITHUB_PATH"
+          "$HOME/.rokit/bin/rokit" install --no-trust-check
+      - name: Publier
+        if: steps.cfg.outputs.skip != 'true'
+        run: bash scripts/publish.sh test

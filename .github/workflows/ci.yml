@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Rokit et les outils
+        run: |
+          curl -sSf https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.sh | bash
+          echo "$HOME/.rokit/bin" >> "$GITHUB_PATH"
+          "$HOME/.rokit/bin/rokit" install --no-trust-check
+
+      - name: Format (StyLua)
+        run: stylua --check src tests
+
+      - name: Lint (selene)
+        run: selene src
+
+      - name: Tests (Lune)
+        run: lune run tests/run
+
+      - name: Build (Rojo)
+        run: rojo build -o build.rbxl
+
+      - name: Typage strict (luau-lsp)
+        run: |
+          rojo sourcemap default.project.json -o sourcemap.json
+          curl -sSfL -o globalTypes.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/main/scripts/globalTypes.d.luau
+          luau-lsp analyze --definitions=@roblox=globalTypes.d.luau --sourcemap=sourcemap.json --base-luaurc=.luaurc src
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: build.rbxl
