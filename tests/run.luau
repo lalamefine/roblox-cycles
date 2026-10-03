@@ -5,6 +5,7 @@ local framework = require("./framework")
 
 local specs = {
 	require("./Kit.spec"),
+	require("./Game.spec"),
 }
 
 if not framework.run(specs) then
