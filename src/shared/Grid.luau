@@ -144,6 +144,12 @@ function Grid.step(self: Grid, cycles: { Cycle }): { number }
 	return eliminated
 end
 
+-- Position dans le monde (X, Z en studs) du centre d'une case ; l'arène est centrée sur l'origine.
+function Grid.toWorld(x: number, z: number, size: number, cellStuds: number): (number, number)
+	local half = (size - 1) / 2
+	return (x - half) * cellStuds, (z - half) * cellStuds
+end
+
 -- Points d'apparition répartis sur un cercle autour du centre, chacun tourné vers le centre
 -- selon l'axe dominant. Les cases renvoyées sont distinctes et à au moins `margin` cases du bord.
 function Grid.spawnPoints(size: number, count: number, margin: number): { { x: number, z: number, dir: Dir } }
