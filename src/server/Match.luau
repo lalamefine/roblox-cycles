@@ -1,5 +1,6 @@
 --!strict
--- Boucle de jeu serveur : salle d'attente, manches, avance des motos à pas fixe, bots, victoires.
+-- Boucle de jeu serveur : match à mort par équipe avec réapparition, avance des motos à pas fixe,
+-- murs de longueur limitée, bots, score par équipe.
 -- Le serveur fait autorité ; les clients n'envoient que des virages (Protocol.TURN).
 
 local Players = game:GetService("Players")
@@ -13,29 +14,42 @@ local Round = require(Shared.Round)
 local BotBrain = require(Shared.BotBrain)
 local Protocol = require(Shared.Protocol)
 local Net = require(Shared.Kit.Net)
-local Signal = require(Shared.Kit.Signal)
 
 local TICK_DT = 1 / Config.TICK_RATE
 local MAX_STEPS_PER_FRAME = 5
+local SPAWN_ATTEMPTS = 60
 
 type Rider = {
 	id: number,
+	team: number,
 	name: string,
 	player: Player?,
-	color: number,
 	cycle: Grid.Cycle,
 	path: { number },
+	eloDelta: number?,
+}
+
+-- Joueur présent à la fin d'un match, avec son équipe et ses statistiques de la partie.
+export type Participant = { player: Player, team: number, kills: number, deaths: number }
+
+export type Hooks = {
+	-- Cote affichée d'un joueur (nil si son profil n'est pas encore chargé).
+	ratingOf: (player: Player) -> number?,
+	-- Un client vient de se connecter (pour lui envoyer ce qui ne passe pas par l'instantané).
+	onReady: (player: Player) -> (),
+	-- Fin de match : renvoie la variation de cote de chaque joueur, pour l'afficher.
+	onMatchEnd: (outcome: Round.Outcome, participants: { Participant }) -> { [Player]: number },
 }
 
 local Match = {}
--- Fin de manche : vainqueur (nil si égalité) et joueurs humains qui ont participé.
-Match.RoundEnded = Signal.new() :: Signal.Signal<Player?, { Player }>
 
+local hooks: Hooks? = nil
 local rng = Random.new()
 local round = Round.new({
 	countdown = Config.COUNTDOWN,
-	timeLimit = Config.ROUND_TIME_LIMIT,
+	duration = Config.MATCH_DURATION,
 	resultsDuration = Config.RESULTS_DURATION,
+	respawnDelay = Config.RESPAWN_DELAY,
 })
 local grid = Grid.new(Config.ARENA_SIZE)
 local riders: { Rider } = {}
@@ -43,37 +57,42 @@ local riderByPlayer: { [Player]: Rider } = {}
 local cycles: { Grid.Cycle } = {}
 local roundId = 0
 local lobbyTimer = Config.LOBBY_WAIT
-local pendingDead: { number } = {}
 local botOptions: BotBrain.Options = {
 	floodCap = Config.BOT_FLOOD_CAP,
 	mistakeChance = Config.BOT_MISTAKE_CHANCE,
 }
 
+local function botName(id: number): string
+	return `Bot {id}`
+end
+
 local function snapshot(): Protocol.Snapshot
 	local list: { Protocol.Rider } = {}
 	for _, r in riders do
+		local stats = round.stats[r.id] or { kills = 0, deaths = 0 }
 		table.insert(list, {
 			id = r.id,
 			name = r.name,
 			userId = if r.player then r.player.UserId else 0,
-			color = r.color,
+			team = r.team,
 			alive = r.cycle.alive,
 			x = r.cycle.x,
 			z = r.cycle.z,
 			dir = r.cycle.dir,
 			path = r.path,
+			kills = stats.kills,
+			deaths = stats.deaths,
+			elo = if r.player and hooks then hooks.ratingOf(r.player) else nil,
+			eloDelta = r.eloDelta,
 		})
-	end
-	local winner = nil
-	if round.phase == "Results" and round.outcome then
-		winner = round.outcome.winner
 	end
 	return {
 		roundId = roundId,
 		phase = round.phase,
 		riders = list,
 		timer = if round.phase == "Waiting" then lobbyTimer else round.timer,
-		winner = winner,
+		teamKills = table.clone(round.teamKills),
+		winnerTeam = if round.phase == "Results" and round.outcome then round.outcome.winnerTeam else nil,
 	}
 end
 
@@ -81,50 +100,103 @@ local function broadcastSnapshot()
 	Net.event(Protocol.SNAPSHOT):FireAllClients(snapshot())
 end
 
+local function humansIn(team: number): number
+	local n = 0
+	for _, r in riders do
+		if r.team == team and r.player then
+			n += 1
+		end
+	end
+	return n
+end
+
+-- Confie à un joueur la moto d'un bot, dans l'équipe qui compte le moins d'humains.
+-- Renvoie faux si toutes les places sont prises par des joueurs.
+local function seat(player: Player): boolean
+	if riderByPlayer[player] then
+		return true
+	end
+	local first = if humansIn(1) <= humansIn(2) then 1 else 2
+	for _, team in { first, 3 - first } do
+		for _, r in riders do
+			if r.team == team and r.player == nil then
+				r.player = player
+				r.name = player.DisplayName
+				r.cycle.turns = {}
+				riderByPlayer[player] = r
+				return true
+			end
+		end
+	end
+	return false
+end
+
 local function startRound()
 	roundId += 1
 	grid = Grid.new(Config.ARENA_SIZE)
-	riders, riderByPlayer, cycles, pendingDead = {}, {}, {}, {}
+	riders, riderByPlayer, cycles = {}, {}, {}
 
-	local humans = Players:GetPlayers()
-	local points = Grid.spawnPoints(Config.ARENA_SIZE, Config.MAX_RIDERS, Config.SPAWN_MARGIN)
-	-- Mélange des apparitions pour varier les duels d'une manche à l'autre.
-	for i = #points, 2, -1 do
-		local j = rng:NextInteger(1, i)
-		points[i], points[j] = points[j], points[i]
-	end
-
-	local ids = {}
-	for i = 1, Config.MAX_RIDERS do
-		local p = points[i]
-		local player: Player? = humans[i]
-		local cycle = Grid.newCycle(i, p.x, p.z, p.dir)
-		grid:occupy(p.x, p.z, i)
-		local rider: Rider = {
-			id = i,
-			name = if player then player.DisplayName else `Bot {i}`,
-			player = player,
-			color = i,
-			cycle = cycle,
-			path = { p.x, p.z },
-		}
-		table.insert(riders, rider)
-		table.insert(cycles, cycle)
-		table.insert(ids, i)
-		if player then
-			riderByPlayer[player] = rider
+	local entries: { Round.Entry } = {}
+	for team = 1, 2 do
+		local points = Grid.teamSpawns(Config.ARENA_SIZE, Config.SPAWN_MARGIN, team, Config.TEAM_SIZE)
+		for _, p in points do
+			local id = #riders + 1
+			local cycle = Grid.newCycle(id, p.x, p.z, p.dir)
+			grid:occupy(p.x, p.z, id)
+			table.insert(riders, {
+				id = id,
+				team = team,
+				name = botName(id),
+				player = nil,
+				cycle = cycle,
+				path = { p.x, p.z },
+				eloDelta = nil,
+			})
+			table.insert(cycles, cycle)
+			table.insert(entries, { id = id, team = team })
 		end
 	end
-	round:start(ids)
+	for _, player in Players:GetPlayers() do
+		seat(player)
+	end
+	round:start(entries)
 	broadcastSnapshot()
 end
 
-local function eliminateNow(rider: Rider)
-	rider.cycle.alive = false
-	table.insert(pendingDead, rider.id)
+local function enemyHeads(team: number): { number }
+	local heads = {}
+	for _, r in riders do
+		if r.team ~= team and r.cycle.alive then
+			table.insert(heads, r.cycle.x)
+			table.insert(heads, r.cycle.z)
+		end
+	end
+	return heads
 end
 
-local function race()
+local function respawn(r: Rider): boolean
+	local spot = grid:findSpawn({
+		team = r.team,
+		margin = Config.SPAWN_MARGIN,
+		clearAhead = Config.SPAWN_CLEAR_AHEAD,
+		enemies = enemyHeads(r.team),
+		minEnemyDistance = Config.SPAWN_MIN_ENEMY_DISTANCE,
+		attempts = SPAWN_ATTEMPTS,
+	}, function(a, b)
+		return rng:NextInteger(a, b)
+	end)
+	if not spot then
+		return false
+	end
+	grid:clearOwner(r.id)
+	local c = r.cycle
+	c.x, c.z, c.dir, c.alive, c.turns = spot.x, spot.z, spot.dir, true, {}
+	grid:occupy(spot.x, spot.z, r.id)
+	r.path = { spot.x, spot.z }
+	return true
+end
+
+local function play()
 	-- Les bots décident avant que tout le monde avance.
 	for _, r in riders do
 		if r.cycle.alive and r.player == nil then
@@ -140,11 +212,7 @@ local function race()
 		before[r.id] = { r.cycle.x, r.cycle.z, r.cycle.dir }
 	end
 
-	local dead = grid:step(cycles)
-	for _, id in pendingDead do
-		table.insert(dead, id)
-	end
-	pendingDead = {}
+	local dead, hitBy = grid:step(cycles)
 
 	local moves = {}
 	for _, r in riders do
@@ -156,6 +224,8 @@ local function race()
 				table.insert(r.path, b[1])
 				table.insert(r.path, b[2])
 			end
+			grid:trim(r.id, Config.TRAIL_MAX_LENGTH)
+			Grid.trimPath(r.path, c.x, c.z, Config.TRAIL_MAX_LENGTH)
 			table.insert(moves, r.id)
 			table.insert(moves, c.x)
 			table.insert(moves, c.z)
@@ -163,32 +233,55 @@ local function race()
 		end
 	end
 
+	local killers = {}
 	local cleared = {}
 	for _, id in dead do
-		round:eliminate(id)
+		local _, killer = round:kill(id, hitBy[id])
+		table.insert(killers, killer or 0)
 		if Config.TRAIL_CLEARS_ON_DEATH then
 			grid:clearOwner(id)
 			table.insert(cleared, id)
 		end
 	end
 
-	local tick: Protocol.Tick = { moves = moves, dead = dead, cleared = cleared }
+	local spawns = {}
+	for _, id in round:takeRespawns() do
+		local r = riders[id]
+		if respawn(r) then
+			table.insert(spawns, id)
+			table.insert(spawns, r.cycle.x)
+			table.insert(spawns, r.cycle.z)
+			table.insert(spawns, r.cycle.dir)
+		else
+			round:delayRespawn(id, Config.RESPAWN_RETRY)
+		end
+	end
+
+	local tick: Protocol.Tick = { moves = moves, dead = dead, killers = killers, cleared = cleared, spawns = spawns }
 	Net.event(Protocol.TICK):FireAllClients(tick)
 end
 
 local function finishRound()
 	local outcome = round.outcome
-	local winner: Player? = nil
-	local participants = {}
+	if not outcome or not hooks then
+		return
+	end
+	local participants: { Participant } = {}
 	for _, r in riders do
 		if r.player and r.player.Parent then
-			table.insert(participants, r.player)
-			if outcome and outcome.winner == r.id then
-				winner = r.player
-			end
+			local stats = round.stats[r.id]
+			table.insert(participants, {
+				player = r.player,
+				team = r.team,
+				kills = stats.kills,
+				deaths = stats.deaths,
+			})
 		end
 	end
-	Match.RoundEnded:Fire(winner, participants)
+	local deltas = hooks.onMatchEnd(outcome, participants)
+	for _, r in riders do
+		r.eloDelta = if r.player then deltas[r.player] else nil
+	end
 end
 
 local function step()
@@ -204,8 +297,8 @@ local function step()
 		return
 	end
 
-	if round.phase == "Racing" then
-		race()
+	if round.phase == "Playing" then
+		play()
 	end
 	local changed = round:update(TICK_DT)
 	if changed == "Results" then
@@ -218,16 +311,18 @@ local function step()
 	end
 end
 
-function Match.start()
+function Match.start(matchHooks: Hooks)
+	hooks = matchHooks
 	Players.CharacterAutoLoads = false
-	Net.setup({ events = { Protocol.READY, Protocol.TURN, Protocol.SNAPSHOT, Protocol.TICK } })
+	Net.setup({ events = { Protocol.READY, Protocol.TURN, Protocol.SNAPSHOT, Protocol.TICK, Protocol.RANKING } })
 
 	Net.onServerEvent(Protocol.READY, function(player: Player)
 		Net.event(Protocol.SNAPSHOT):FireClient(player, snapshot())
+		matchHooks.onReady(player)
 	end, { burst = 2, perSecond = 0.5 })
 
 	Net.onServerEvent(Protocol.TURN, function(player: Player, turn: any)
-		if not Protocol.isValidTurn(turn) or round.phase ~= "Racing" then
+		if not Protocol.isValidTurn(turn) or round.phase ~= "Playing" then
 			return
 		end
 		local rider = riderByPlayer[player]
@@ -236,17 +331,24 @@ function Match.start()
 		end
 	end, { burst = 10, perSecond = 15 })
 
+	-- Un joueur qui arrive en cours de match reprend la moto d'un bot.
+	Players.PlayerAdded:Connect(function(player)
+		if (round.phase == "Countdown" or round.phase == "Playing") and seat(player) then
+			broadcastSnapshot()
+		end
+	end)
+
+	-- Un joueur qui part laisse sa moto à un bot ; son équipe garde ses éliminations.
 	Players.PlayerRemoving:Connect(function(player)
 		local rider = riderByPlayer[player]
 		riderByPlayer[player] = nil
-		if not rider or not rider.cycle.alive then
+		if not rider then
 			return
 		end
-		if round.phase == "Racing" then
-			eliminateNow(rider)
-		else
-			-- Départ pendant le compte à rebours : un bot reprend la moto.
-			rider.player = nil
+		rider.player = nil
+		rider.name = botName(rider.id)
+		if round.phase ~= "Waiting" then
+			broadcastSnapshot()
 		end
 	end)
 

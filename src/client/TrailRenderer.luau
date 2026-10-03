@@ -1,7 +1,8 @@
 --!strict
 -- Rendu local des motos et de leurs murs à partir des messages du serveur.
--- Un mur = une Part étirée par segment droit ; le segment en cours s'allonge à chaque image,
--- en interpolant entre les deux derniers ticks pour un mouvement fluide.
+-- Un mur = une suite de coins reliés à la tête ; il est redessiné à chaque image depuis la tête
+-- interpolée entre les deux derniers ticks, sur au plus Config.TRAIL_MAX_LENGTH cases, ce qui fait
+-- avancer la queue au même rythme que la tête. Une Part étirée par segment droit, réutilisées.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -11,15 +12,16 @@ local Protocol = require(ReplicatedStorage.Shared.Protocol)
 
 local WALL_Y = Config.WALL_HEIGHT / 2
 local BIKE_SIZE = Vector3.new(1.2, 1.4, 3.2)
+local TRAIL_REACH = Config.TRAIL_MAX_LENGTH - 1 -- longueur du mur derrière la tête, en cases
+-- Coins gardés un peu au-delà du mur, car la tête affichée a jusqu'à une case de retard.
+local PATH_KEEP = Config.TRAIL_MAX_LENGTH + 2
 
 type View = {
 	info: Protocol.Rider,
 	color: Color3,
 	alive: boolean,
-	segments: { BasePart },
-	current: BasePart?,
-	cornerX: number,
-	cornerZ: number,
+	path: { number }, -- coins du mur, le dernier relié à la tête ; vide si le mur est effacé
+	walls: { BasePart },
 	prevX: number,
 	prevZ: number,
 	x: number,
@@ -44,8 +46,8 @@ local function forward(dir: number): Vector3
 	return Vector3.new(d[1], 0, d[2])
 end
 
-local function colorOf(index: number): Color3
-	local rgb = Config.COLORS[((index - 1) % #Config.COLORS) + 1]
+function TrailRenderer.teamColor(team: number): Color3
+	local rgb = Config.TEAMS[((team - 1) % #Config.TEAMS) + 1].color
 	return Color3.fromRGB(rgb[1], rgb[2], rgb[3])
 end
 
@@ -70,19 +72,19 @@ local function fitWall(p: BasePart, a: Vector3, b: Vector3)
 	p.Position = (a + b) / 2
 end
 
-local function clearWalls(v: View)
-	for _, s in v.segments do
-		s:Destroy()
+-- Garde exactement `count` Parts de mur pour cette moto.
+local function useWalls(v: View, count: number)
+	for i = #v.walls + 1, count do
+		v.walls[i] = newPart("Mur", v.color)
 	end
-	v.segments = {}
-	if v.current then
-		v.current:Destroy()
-		v.current = nil
+	for i = #v.walls, count + 1, -1 do
+		v.walls[i]:Destroy()
+		v.walls[i] = nil
 	end
 end
 
 local function destroyView(v: View)
-	clearWalls(v)
+	useWalls(v, 0)
 	if v.bike then
 		v.bike:Destroy()
 		v.bike = nil
@@ -90,6 +92,9 @@ local function destroyView(v: View)
 end
 
 local function makeBike(v: View)
+	if v.bike then
+		return
+	end
 	local bike = newPart(`Moto_{v.info.name}`, v.color)
 	bike.Size = BIKE_SIZE
 	local light = Instance.new("PointLight")
@@ -100,7 +105,7 @@ local function makeBike(v: View)
 	v.bike = bike
 end
 
--- Repart de zéro à partir d'un état complet (début de manche ou arrivée en cours de partie).
+-- Repart de zéro à partir d'un état complet (changement de phase, arrivée ou départ d'un joueur).
 function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 	if not folder then
 		local f = Instance.new("Folder")
@@ -113,14 +118,13 @@ function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 	end
 	views = {}
 	for _, info in snapshot.riders do
+		local cleared = not info.alive and Config.TRAIL_CLEARS_ON_DEATH
 		local v: View = {
 			info = info,
-			color = colorOf(info.color),
+			color = TrailRenderer.teamColor(info.team),
 			alive = info.alive,
-			segments = {},
-			current = nil,
-			cornerX = info.x,
-			cornerZ = info.z,
+			path = if cleared then {} else table.clone(info.path),
+			walls = {},
 			prevX = info.x,
 			prevZ = info.z,
 			x = info.x,
@@ -128,17 +132,6 @@ function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 			dir = info.dir,
 			bike = nil,
 		}
-		local path = info.path
-		local cleared = not info.alive and Config.TRAIL_CLEARS_ON_DEATH
-		if not cleared then
-			for i = 1, #path - 2, 2 do
-				local seg = newPart("Mur", v.color)
-				fitWall(seg, world(path[i], path[i + 1]), world(path[i + 2], path[i + 3]))
-				table.insert(v.segments, seg)
-			end
-			v.cornerX, v.cornerZ = path[#path - 1], path[#path]
-			v.current = newPart("Mur", v.color)
-		end
 		if info.alive then
 			makeBike(v)
 		end
@@ -148,21 +141,31 @@ function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 	TrailRenderer.render()
 end
 
+local function explode(v: View)
+	local boom = Instance.new("Explosion")
+	boom.BlastPressure = 0
+	boom.BlastRadius = 6 -- taille visuelle ; aucun effet physique (pression et joints à 0)
+	boom.DestroyJointRadiusPercent = 0
+	boom.Position = world(v.x, v.z)
+	boom.Parent = workspace
+end
+
 function TrailRenderer.applyTick(tick: Protocol.Tick)
 	local m = tick.moves
 	for i = 1, #m, 4 do
 		local v = views[m[i]]
 		if v then
 			local x, z, dir = m[i + 1], m[i + 2], m[i + 3]
-			if dir ~= v.dir and v.current then
-				-- Virage à l'ancienne tête : le segment en cours devient fixe.
-				fitWall(v.current, world(v.cornerX, v.cornerZ), world(v.x, v.z))
-				table.insert(v.segments, v.current)
-				v.current = newPart("Mur", v.color)
-				v.cornerX, v.cornerZ = v.x, v.z
+			if dir ~= v.dir and #v.path > 0 then
+				-- Virage à l'ancienne tête : elle devient un coin du mur.
+				table.insert(v.path, v.x)
+				table.insert(v.path, v.z)
 			end
 			v.prevX, v.prevZ = v.x, v.z
 			v.x, v.z, v.dir = x, z, dir
+			if #v.path > 0 then
+				Grid.trimPath(v.path, x, z, PATH_KEEP)
+			end
 		end
 	end
 	for _, id in tick.dead do
@@ -170,12 +173,7 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 		if v and v.alive then
 			v.alive = false
 			v.prevX, v.prevZ = v.x, v.z
-			local boom = Instance.new("Explosion")
-			boom.BlastPressure = 0
-			boom.BlastRadius = 6 -- taille visuelle ; aucun effet physique (pression et joints à 0)
-			boom.DestroyJointRadiusPercent = 0
-			boom.Position = world(v.x, v.z)
-			boom.Parent = workspace
+			explode(v)
 			if v.bike then
 				v.bike:Destroy()
 				v.bike = nil
@@ -185,27 +183,67 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 	for _, id in tick.cleared do
 		local v = views[id]
 		if v then
-			clearWalls(v)
+			v.path = {}
+			useWalls(v, 0)
+		end
+	end
+	local s = tick.spawns
+	for i = 1, #s, 4 do
+		local v = views[s[i]]
+		if v then
+			v.alive = true
+			v.x, v.z, v.dir = s[i + 1], s[i + 2], s[i + 3]
+			v.prevX, v.prevZ = v.x, v.z
+			v.path = { v.x, v.z }
+			makeBike(v)
 		end
 	end
 	tickClock = os.clock()
 end
 
--- Position affichée de la tête d'une moto (interpolée) et sa direction.
-local function headOf(v: View): (Vector3, Vector3)
+-- Position affichée de la tête d'une moto, en cases (interpolée), et sa direction.
+local function headCell(v: View): (number, number)
 	local alpha = math.clamp((os.clock() - tickClock) * Config.TICK_RATE, 0, 1)
-	local a, b = world(v.prevX, v.prevZ), world(v.x, v.z)
-	return a:Lerp(b, alpha), forward(v.dir)
+	return v.prevX + (v.x - v.prevX) * alpha, v.prevZ + (v.z - v.prevZ) * alpha
+end
+
+-- Redessine le mur depuis la tête en remontant les coins, sur TRAIL_REACH cases au plus.
+local function drawTrail(v: View, hx: number, hz: number)
+	local path = v.path
+	if #path == 0 then
+		useWalls(v, 0)
+		return
+	end
+	local segments = {}
+	local px, pz = hx, hz
+	local remaining = TRAIL_REACH
+	for i = #path - 1, 1, -2 do
+		local cx, cz = path[i], path[i + 1]
+		local len = math.abs(cx - px) + math.abs(cz - pz)
+		if len >= remaining then
+			local k = if len > 0 then remaining / len else 0
+			table.insert(segments, { px, pz, px + (cx - px) * k, pz + (cz - pz) * k })
+			break
+		end
+		if len > 0 then
+			table.insert(segments, { px, pz, cx, cz })
+		end
+		remaining -= len
+		px, pz = cx, cz
+	end
+	useWalls(v, #segments)
+	for i, seg in segments do
+		fitWall(v.walls[i], world(seg[1], seg[2]), world(seg[3], seg[4]))
+	end
 end
 
 -- À appeler à chaque image.
 function TrailRenderer.render()
 	for _, v in views do
-		local head, fwd = headOf(v)
-		if v.current then
-			fitWall(v.current, world(v.cornerX, v.cornerZ), head)
-		end
+		local hx, hz = headCell(v)
+		drawTrail(v, hx, hz)
 		if v.bike then
+			local head, fwd = world(hx, hz), forward(v.dir)
 			-- La moto roule devant son mur.
 			v.bike.CFrame = CFrame.lookAt(head + fwd * (BIKE_SIZE.Z / 2), head + fwd * BIKE_SIZE.Z)
 		end
@@ -218,23 +256,13 @@ function TrailRenderer.focus(id: number): (Vector3?, Vector3?)
 	if not v then
 		return nil, nil
 	end
-	return headOf(v)
+	local hx, hz = headCell(v)
+	return world(hx, hz), forward(v.dir)
 end
 
 function TrailRenderer.isAlive(id: number): boolean
 	local v = views[id]
 	return v ~= nil and v.alive
-end
-
-function TrailRenderer.aliveCount(): (number, number)
-	local alive, total = 0, 0
-	for _, v in views do
-		total += 1
-		if v.alive then
-			alive += 1
-		end
-	end
-	return alive, total
 end
 
 return TrailRenderer

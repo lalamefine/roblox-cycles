@@ -10,7 +10,8 @@ export type Entry = { userId: number, score: number, rank: number }
 
 export type Leaderboard = {
 	name: string,
-	-- Propose un score : seul le meilleur depuis la dernière écriture est envoyé.
+	-- Propose un score : seul le meilleur depuis la dernière écriture est envoyé
+	-- (le dernier proposé si l'option `keepBest` vaut false).
 	submit: (self: Leaderboard, userId: number, score: number) -> (),
 	top: (self: Leaderboard) -> { Entry },
 	Updated: Signal.Signal<{ Entry }>,
@@ -22,11 +23,15 @@ export type Options = {
 	size: number?, -- taille du top (défaut 50)
 	flushSeconds: number?, -- intervalle d'écriture (défaut 60)
 	refreshSeconds: number?, -- intervalle de lecture (défaut 120)
+	-- true (défaut) : on garde le meilleur score de chaque joueur (record, victoires).
+	-- false : on garde le dernier score proposé, qui peut baisser (cote Elo).
+	keepBest: boolean?,
 }
 
 function Leaderboard.new(name: string, options: Options?): Leaderboard
 	local opts: Options = options or {}
 	local size = opts.size or 50
+	local keepBest = opts.keepBest ~= false
 	local ok, store = pcall(DataStoreService.GetOrderedDataStore, DataStoreService, name)
 	if not ok then
 		warn("[Leaderboard] indisponible :", name, store)
@@ -43,7 +48,7 @@ function Leaderboard.new(name: string, options: Options?): Leaderboard
 
 	function self.submit(_: Leaderboard, userId: number, score: number)
 		local s = math.floor(score)
-		if s > (pending[userId] or -math.huge) then
+		if not keepBest or s > (pending[userId] or -math.huge) then
 			pending[userId] = s
 		end
 	end
@@ -61,7 +66,7 @@ function Leaderboard.new(name: string, options: Options?): Leaderboard
 		for userId, score in batch do
 			pcall(function()
 				(store :: OrderedDataStore):UpdateAsync(tostring(userId), function(old: number?): any
-					if old and old >= score then
+					if keepBest and old and old >= score then
 						return nil
 					end
 					return score
