@@ -29,8 +29,8 @@ function Hud.build()
 	gui.Name = "Hud"
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
-	center = label(gui, UDim2.new(1, 0, 0, 80), UDim2.new(0.5, 0, 0.3, 0), 48)
-	corner = label(gui, UDim2.new(0, 260, 0, 30), UDim2.new(0.5, 0, 0, 12), 22)
+	center = label(gui, UDim2.new(1, 0, 0, 80), UDim2.fromScale(0.5, 0.3), 48)
+	corner = label(gui, UDim2.fromOffset(260, 30), UDim2.new(0.5, 0, 0, 12), 22)
 	gui.Parent = (Players.LocalPlayer :: Player):WaitForChild("PlayerGui")
 end
 

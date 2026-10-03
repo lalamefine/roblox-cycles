@@ -35,7 +35,7 @@ function Input.bind(onTurn: (turn: number) -> ())
 	)
 	ContextActionService:SetTitle("VirageGauche", "◀")
 	ContextActionService:SetTitle("VirageDroite", "▶")
-	ContextActionService:SetPosition("VirageGauche", UDim2.new(0.05, 0, 0.55, 0))
+	ContextActionService:SetPosition("VirageGauche", UDim2.fromScale(0.05, 0.55))
 	ContextActionService:SetPosition("VirageDroite", UDim2.new(1, -110, 0.55, 0))
 end
 
