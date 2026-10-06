@@ -57,10 +57,11 @@ function ArenaView.build(): Folder
 	Lighting.Brightness = 1
 	Lighting.Ambient = Color3.fromRGB(25, 25, 45)
 	Lighting.OutdoorAmbient = Color3.fromRGB(25, 25, 45)
+	-- Bloom léger et serré : un halo autour du néon sans flouter toute l'image.
 	local bloom = Instance.new("BloomEffect")
-	bloom.Intensity = 1
-	bloom.Size = 24
-	bloom.Threshold = 0.8
+	bloom.Intensity = 0.4
+	bloom.Size = 8
+	bloom.Threshold = 0.9
 	bloom.Parent = Lighting
 
 	folder.Parent = workspace
