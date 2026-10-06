@@ -63,6 +63,11 @@ function ArenaView.build(): Folder
 	bloom.Size = 8
 	bloom.Threshold = 0.9
 	bloom.Parent = Lighting
+	-- Couleurs un peu plus franches pour que les néons ressortent sur le sol sombre.
+	local grade = Instance.new("ColorCorrectionEffect")
+	grade.Saturation = 0.15
+	grade.Contrast = 0.1
+	grade.Parent = Lighting
 
 	folder.Parent = workspace
 	return folder
