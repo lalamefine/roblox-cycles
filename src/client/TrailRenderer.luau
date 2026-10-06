@@ -8,7 +8,10 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Config = require(ReplicatedStorage.Shared.Config)
 local Grid = require(ReplicatedStorage.Shared.Grid)
+local Juice = require(ReplicatedStorage.Shared.Juice)
 local Protocol = require(ReplicatedStorage.Shared.Protocol)
+
+local Vfx = require(script.Parent.Vfx)
 
 local WALL_Y = Config.WALL_HEIGHT / 2
 local BIKE_SIZE = Vector3.new(1.2, 1.4, 3.2)
@@ -28,6 +31,7 @@ type View = {
 	z: number,
 	dir: number,
 	bike: BasePart?,
+	lean: number, -- inclinaison affichée de la moto, en degrés (positive : vers la droite)
 }
 
 local TrailRenderer = {}
@@ -35,6 +39,7 @@ local TrailRenderer = {}
 local folder: Folder? = nil
 local views: { [number]: View } = {}
 local tickClock = 0
+local renderClock = os.clock()
 
 local function world(x: number, z: number): Vector3
 	local wx, wz = Grid.toWorld(x, z, Config.ARENA_SIZE, Config.CELL_STUDS)
@@ -102,6 +107,8 @@ local function makeBike(v: View)
 	light.Range = 12
 	light.Brightness = 2
 	light.Parent = bike
+	Vfx.attachExhaust(bike, v.color)
+	v.lean = 0
 	v.bike = bike
 end
 
@@ -131,6 +138,7 @@ function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 			z = info.z,
 			dir = info.dir,
 			bike = nil,
+			lean = 0,
 		}
 		if info.alive then
 			makeBike(v)
@@ -139,15 +147,6 @@ function TrailRenderer.reset(snapshot: Protocol.Snapshot)
 	end
 	tickClock = os.clock()
 	TrailRenderer.render()
-end
-
-local function explode(v: View)
-	local boom = Instance.new("Explosion")
-	boom.BlastPressure = 0
-	boom.BlastRadius = 6 -- taille visuelle ; aucun effet physique (pression et joints à 0)
-	boom.DestroyJointRadiusPercent = 0
-	boom.Position = world(v.x, v.z)
-	boom.Parent = workspace
 end
 
 function TrailRenderer.applyTick(tick: Protocol.Tick)
@@ -161,6 +160,12 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 				table.insert(v.path, v.x)
 				table.insert(v.path, v.z)
 			end
+			if dir ~= v.dir and v.alive then
+				local sign = Juice.turnSign(v.dir, dir)
+				v.lean = sign * Juice.LEAN_ANGLE
+				-- L'élan emporte les étincelles dans l'ancienne direction.
+				Vfx.turnSparks(world(v.x, v.z), forward(v.dir), v.color)
+			end
 			v.prevX, v.prevZ = v.x, v.z
 			v.x, v.z, v.dir = x, z, dir
 			if #v.path > 0 then
@@ -173,7 +178,7 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 		if v and v.alive then
 			v.alive = false
 			v.prevX, v.prevZ = v.x, v.z
-			explode(v)
+			Vfx.explode(world(v.x, v.z), v.color)
 			if v.bike then
 				v.bike:Destroy()
 				v.bike = nil
@@ -184,7 +189,9 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 		local v = views[id]
 		if v then
 			v.path = {}
-			useWalls(v, 0)
+			-- Les Parts du mur partent fondre dans le sol ; la moto en recrée à sa réapparition.
+			Vfx.dissolve(v.walls)
+			v.walls = {}
 		end
 	end
 	local s = tick.spawns
@@ -196,6 +203,7 @@ function TrailRenderer.applyTick(tick: Protocol.Tick)
 			v.prevX, v.prevZ = v.x, v.z
 			v.path = { v.x, v.z }
 			makeBike(v)
+			Vfx.respawn(world(v.x, v.z), v.color)
 		end
 	end
 	tickClock = os.clock()
@@ -239,13 +247,18 @@ end
 
 -- À appeler à chaque image.
 function TrailRenderer.render()
+	local now = os.clock()
+	local dt = now - renderClock
+	renderClock = now
 	for _, v in views do
 		local hx, hz = headCell(v)
 		drawTrail(v, hx, hz)
 		if v.bike then
 			local head, fwd = world(hx, hz), forward(v.dir)
 			-- La moto roule devant son mur.
+			v.lean = Juice.approach(v.lean, 0, Juice.LEAN_RECOVER, dt)
 			v.bike.CFrame = CFrame.lookAt(head + fwd * (BIKE_SIZE.Z / 2), head + fwd * BIKE_SIZE.Z)
+				* CFrame.Angles(0, 0, -math.rad(v.lean))
 		end
 	end
 end
